@@ -162,3 +162,4 @@ build.config.msm.*
 
 # oplus internel abi
 android/abi_gki_aarch64_oplus_internal
+setup.sh
