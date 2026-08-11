@@ -946,7 +946,7 @@ unsigned int sysctl_sched_uclamp_util_max = SCHED_CAPACITY_SCALE;
  * This knob will not override the system default sched_util_clamp_min defined
  * above.
  */
-unsigned int sysctl_sched_uclamp_util_min_rt_default = SCHED_CAPACITY_SCALE;
+unsigned int sysctl_sched_uclamp_util_min_rt_default = SCHED_CAPACITY_SCALE / 2;
 
 /* All clamps are required to be less or equal than these values */
 static struct uclamp_se uclamp_default[UCLAMP_CNT];
@@ -1637,6 +1637,15 @@ static void __init init_uclamp(void)
 		root_task_group.uclamp[clamp_id] = uc_max;
 #endif
 	}
+
+	/*
+	 * Bake-in uclamp from boot.  Without the static key, schedutil's RT
+	 * path returns max frequency for any runnable RT task and the
+	 * non-zero sched_uclamp_util_min_rt_default above has no effect.
+	 * Enabling it here lets the lowered RT clamp actually steer
+	 * frequency (RT util gets clamped to [rt_default, 1024]).
+	 */
+	static_branch_enable(&sched_uclamp_used);
 }
 
 #else /* CONFIG_UCLAMP_TASK */
