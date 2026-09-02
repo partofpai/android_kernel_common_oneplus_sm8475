@@ -612,6 +612,66 @@ static void wakeup_source_activate(struct wakeup_source *ws)
 	trace_wakeup_source_activate(ws->name, cec);
 }
 
+/*
+ * Wakelock blocker.
+ *
+ * Lets userspace suppress named wakeup sources so that they neither abort an
+ * in-progress suspend nor hold the system awake.  Aimed at sources that fire
+ * constantly during standby (modem RX being the usual offender).
+ *
+ * Enabled by default with the list below, which is tuned for this device from
+ * batterystats: suppressing a source that carries a time-critical event will
+ * delay or drop that event, so clear "enabled" via sysfs if something that
+ * needs to arrive during standby stops arriving.
+ *
+ * Matching is by name and struct wakeup_source is deliberately left alone.
+ * Vendor modules are built against the KMI and some of them embed the struct,
+ * so growing it here would break them.
+ */
+#define WLB_MAX_ENTRIES	24
+#define WLB_NAME_LEN	40
+
+/* Populated into wlb_names[] by wakelock_blocker_init(). */
+static const char * const wlb_default_names[] = {
+	"qcom_rx_wakelock",	/* modem RX, 3113 activations per night */
+	"894000.qcom,qup_uart",	/* BT companion sync, every ~4 minutes */
+};
+
+static bool wlb_enabled __read_mostly = true;
+static char wlb_names[WLB_MAX_ENTRIES][WLB_NAME_LEN];
+static int wlb_count;
+static atomic_long_t wlb_blocked_events = ATOMIC_LONG_INIT(0);
+static DEFINE_SPINLOCK(wlb_lock);
+
+/*
+ * Called from wakeup_source_report_event() with ws->lock held and interrupts
+ * off, so keep it short.  wlb_lock nests inside ws->lock and nothing takes
+ * them in the opposite order.
+ */
+static bool wakelock_blocker_match(const char *name)
+{
+	unsigned long flags;
+	bool blocked = false;
+	int i;
+
+	if (!READ_ONCE(wlb_enabled) || !name)
+		return false;
+
+	spin_lock_irqsave(&wlb_lock, flags);
+	for (i = 0; i < wlb_count; i++) {
+		if (!strcmp(wlb_names[i], name)) {
+			blocked = true;
+			break;
+		}
+	}
+	spin_unlock_irqrestore(&wlb_lock, flags);
+
+	if (blocked)
+		atomic_long_inc(&wlb_blocked_events);
+
+	return blocked;
+}
+
 /**
  * wakeup_source_report_event - Report wakeup event using the given source.
  * @ws: Wakeup source to report the event for.
@@ -619,6 +679,15 @@ static void wakeup_source_activate(struct wakeup_source *ws)
  */
 static void wakeup_source_report_event(struct wakeup_source *ws, bool hard)
 {
+	/*
+	 * Drop the event entirely: no activation, no counters, no
+	 * pm_system_wakeup().  Callers stay consistent because
+	 * wakeup_source_deactivate() reconciles relax_count against
+	 * active_count and __pm_relax() only acts on an active source.
+	 */
+	if (wakelock_blocker_match(ws->name))
+		return;
+
 	ws->event_count++;
 	/* This is racy, but the counter is approximate anyway. */
 	if (events_check_enabled)
@@ -1263,3 +1332,153 @@ static int __init wakeup_sources_debugfs_init(void)
 }
 
 postcore_initcall(wakeup_sources_debugfs_init);
+
+static ssize_t wlb_enabled_show(struct kobject *kobj,
+				struct kobj_attribute *attr, char *buf)
+{
+	return sysfs_emit(buf, "%d\n", READ_ONCE(wlb_enabled));
+}
+
+static ssize_t wlb_enabled_store(struct kobject *kobj,
+				 struct kobj_attribute *attr,
+				 const char *buf, size_t count)
+{
+	bool val;
+	int ret;
+
+	ret = kstrtobool(buf, &val);
+	if (ret)
+		return ret;
+
+	WRITE_ONCE(wlb_enabled, val);
+	pr_info("wakelock blocker %s\n", val ? "enabled" : "disabled");
+
+	return count;
+}
+
+static ssize_t wlb_list_show(struct kobject *kobj, struct kobj_attribute *attr,
+			     char *buf)
+{
+	unsigned long flags;
+	int len = 0;
+	int i;
+
+	spin_lock_irqsave(&wlb_lock, flags);
+	for (i = 0; i < wlb_count; i++)
+		len += sysfs_emit_at(buf, len, "%s\n", wlb_names[i]);
+	spin_unlock_irqrestore(&wlb_lock, flags);
+
+	return len;
+}
+
+/*
+ * Whitespace-separated list of wakeup source names, as shown in
+ * /sys/kernel/debug/wakeup_sources.  Each write replaces the whole list;
+ * writing an empty string clears it.
+ */
+static ssize_t wlb_list_store(struct kobject *kobj, struct kobj_attribute *attr,
+			      const char *buf, size_t count)
+{
+	char names[WLB_MAX_ENTRIES][WLB_NAME_LEN] = {};
+	const char *p = buf;
+	unsigned long flags;
+	int n = 0;
+	int i;
+
+	while (*p) {
+		size_t len;
+
+		p = skip_spaces(p);
+		if (!*p)
+			break;
+
+		len = strcspn(p, " \t\n");
+		if (len >= WLB_NAME_LEN)
+			return -EINVAL;
+		if (n == WLB_MAX_ENTRIES)
+			return -E2BIG;
+
+		memcpy(names[n], p, len);
+		n++;
+		p += len;
+	}
+
+	spin_lock_irqsave(&wlb_lock, flags);
+	for (i = 0; i < n; i++)
+		memcpy(wlb_names[i], names[i], WLB_NAME_LEN);
+	wlb_count = n;
+	spin_unlock_irqrestore(&wlb_lock, flags);
+
+	return count;
+}
+
+static ssize_t wlb_blocked_count_show(struct kobject *kobj,
+				      struct kobj_attribute *attr, char *buf)
+{
+	return sysfs_emit(buf, "%ld\n", atomic_long_read(&wlb_blocked_events));
+}
+
+static ssize_t wlb_blocked_count_store(struct kobject *kobj,
+				       struct kobj_attribute *attr,
+				       const char *buf, size_t count)
+{
+	atomic_long_set(&wlb_blocked_events, 0);
+
+	return count;
+}
+
+static struct kobj_attribute wlb_enabled_attr =
+	__ATTR(enabled, 0644, wlb_enabled_show, wlb_enabled_store);
+static struct kobj_attribute wlb_list_attr =
+	__ATTR(list, 0644, wlb_list_show, wlb_list_store);
+static struct kobj_attribute wlb_blocked_count_attr =
+	__ATTR(blocked_count, 0644, wlb_blocked_count_show,
+	       wlb_blocked_count_store);
+
+static struct attribute *wlb_attrs[] = {
+	&wlb_enabled_attr.attr,
+	&wlb_list_attr.attr,
+	&wlb_blocked_count_attr.attr,
+	NULL,
+};
+
+static const struct attribute_group wlb_attr_group = {
+	.attrs = wlb_attrs,
+};
+
+static int __init wakelock_blocker_init(void)
+{
+	struct kobject *kobj;
+	unsigned long flags;
+	int ret;
+	int i;
+
+	BUILD_BUG_ON(ARRAY_SIZE(wlb_default_names) > WLB_MAX_ENTRIES);
+
+	kobj = kobject_create_and_add("wakelock_blocker", kernel_kobj);
+	if (!kobj)
+		return -ENOMEM;
+
+	ret = sysfs_create_group(kobj, &wlb_attr_group);
+	if (ret) {
+		kobject_put(kobj);
+		return ret;
+	}
+
+	/*
+	 * Seeded here rather than as a static initialiser so the count stays in
+	 * step with the list.  Nothing is blocked before this point, which is
+	 * what we want during boot.
+	 */
+	spin_lock_irqsave(&wlb_lock, flags);
+	for (i = 0; i < ARRAY_SIZE(wlb_default_names); i++)
+		strscpy(wlb_names[i], wlb_default_names[i], WLB_NAME_LEN);
+	wlb_count = ARRAY_SIZE(wlb_default_names);
+	spin_unlock_irqrestore(&wlb_lock, flags);
+
+	pr_info("wakelock blocker enabled, %d source(s) blocked\n", wlb_count);
+
+	return 0;
+}
+
+late_initcall(wakelock_blocker_init);
