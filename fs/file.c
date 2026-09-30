@@ -20,6 +20,7 @@
 #include <linux/spinlock.h>
 #include <linux/rcupdate.h>
 #include <linux/close_range.h>
+#include <linux/bitmap.h>
 #include <net/sock.h>
 
 #include "internal.h"
@@ -703,6 +704,19 @@ int __close_fd(struct files_struct *files, unsigned fd)
 }
 EXPORT_SYMBOL(__close_fd); /* for ksys_close() */
 
+static inline void __range_cloexec(struct files_struct *files,
+				   unsigned int fd, unsigned int max_fd)
+{
+	struct fdtable *fdt;
+
+	spin_lock(&files->file_lock);
+	fdt = files_fdtable(files);
+	max_fd = min(max_fd, fdt->max_fds - 1);
+	if (fd <= max_fd)
+		bitmap_set(fdt->close_on_exec, fd, max_fd - fd + 1);
+	spin_unlock(&files->file_lock);
+}
+
 /**
  * __close_range() - Close all file descriptors in a given range.
  *
@@ -718,7 +732,7 @@ int __close_range(unsigned fd, unsigned max_fd, unsigned int flags)
 	struct task_struct *me = current;
 	struct files_struct *cur_fds = me->files, *fds = NULL;
 
-	if (flags & ~CLOSE_RANGE_UNSHARE)
+	if (flags & ~(CLOSE_RANGE_UNSHARE | CLOSE_RANGE_CLOEXEC))
 		return -EINVAL;
 
 	if (fd > max_fd)
@@ -756,7 +770,10 @@ int __close_range(unsigned fd, unsigned max_fd, unsigned int flags)
 	}
 
 	max_fd = min(max_fd, cur_max);
-	while (fd <= max_fd) {
+	if (flags & CLOSE_RANGE_CLOEXEC) {
+		if (fd <= max_fd)
+			__range_cloexec(cur_fds, fd, max_fd);
+	} else while (fd <= max_fd) {
 		struct file *file;
 
 		file = pick_file(cur_fds, fd++);
